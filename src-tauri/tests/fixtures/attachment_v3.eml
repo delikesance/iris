@@ -1,0 +1,24 @@
+From: Bruno Martin <bruno@example.org>
+To: moi@example.com
+Cc: compta@example.org
+Subject: Re: Contrat
+Date: Thu, 29 Oct 2026 09:00:00 +0000
+Message-ID: <att-2@example.org>
+In-Reply-To: <att-1@example.org>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="mix"
+
+--mix
+Content-Type: text/plain; charset=utf-8
+
+Voici le contrat.
+--mix
+Content-Type: application/pdf; name="contrat_v3.pdf"
+Content-Disposition: attachment; filename="contrat_v3.pdf"
+Content-Transfer-Encoding: base64
+
+JVBERi0xLjEKMSAwIG9iajw8L1R5cGUvQ2F0YWxvZy9QYWdlcyAyIDAgUj4+ZW5kb2JqCjIgMCBv
+Ymo8PC9UeXBlL1BhZ2VzL0tpZHNbMyAwIFJdL0NvdW50IDE+PmVuZG9iagozIDAgb2JqPDwvVHlw
+ZS9QYWdlL1BhcmVudCAyIDAgUi9NZWRpYUJveFswIDAgMTAgMTBdPj5lbmRvYmoKdHJhaWxlcjw8
+L1Jvb3QgMSAwIFI+PgolJUVPRgo=
+--mix--

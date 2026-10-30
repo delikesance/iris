@@ -1,0 +1,18 @@
+From: Journal <news@journal.example>
+To: moi@example.com
+Subject: Votre lettre du lundi
+Date: Mon, 26 Oct 2026 07:00:00 +0000
+Message-ID: <nl-42@journal.example>
+List-Unsubscribe: <https://journal.example/u/abc>, <mailto:unsub@journal.example>
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="alt"
+
+--alt
+Content-Type: text/plain; charset=utf-8
+
+Lettre en texte.
+--alt
+Content-Type: text/html; charset=utf-8
+
+<p>Lettre en <b>HTML</b>.</p>
+--alt--

@@ -1,0 +1,54 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Iris",
+  "version": "0.1.0",
+  "identifier": "dev.dksuite.iris",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Iris",
+        "width": 1180,
+        "height": 760,
+        "minWidth": 760,
+        "minHeight": 480
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; frame-src 'self' about: data: blob:; img-src 'self' data: blob:; font-src 'self'; worker-src 'self' blob:; connect-src ipc: http://ipc.localhost asset: http://asset.localhost",
+      "assetProtocol": {
+        "enable": true,
+        "scope": [
+          "$CONFIG/iris/documents/**"
+        ]
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/icon.png",
+      "icons/icon.ico"
+    ],
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEFGOTQ0QjBGNkRERTg5RjQKUldUMGlkNXREMHVVcjNubGxnYkZQTXBaVVB5cjhXeHdYbC9vRHFWSzdvdTVpbHZCbkVYcWNVbUMK",
+      "endpoints": [
+        "https://github.com/delikesance/iris/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
+}
