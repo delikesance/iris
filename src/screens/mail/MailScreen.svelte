@@ -7,7 +7,7 @@
   import { onMount, untrack } from "svelte";
   import { get } from "svelte/store";
   import { listen } from "@tauri-apps/api/event";
-  import { bulkDelete, bulkMove, deleteMessage, getMessage, listFolders, listMessages, markSeen, syncFolder } from "../../lib/api";
+  import { bulkDelete, bulkMove, deleteMessage, getMessage, listFolders, listMessages, syncFolder } from "../../lib/api";
   import { composeDraft, currentFolder, mailQuery, selectedUid, selection, toast } from "../../lib/stores";
   import type { Folder, Full, MessageRow } from "../../lib/types";
   import { Button, ScreenTitle } from "../../components/ui";
@@ -45,13 +45,17 @@
 
   const loadFolders = () => listFolders().then((f) => (folders = f)).catch(fail("Chargement des dossiers impossible"));
 
-  const refresh = () => Promise.all([loadFolders(), loadRows()]);
+  // Un seul rafraîchissement à la fois : l'événement `mail://changed` et la fin de la synchronisation arrivent presque ensemble.
+  let inflight: Promise<unknown> | null = null;
+  const refresh = () => (inflight ??= Promise.all([loadFolders(), loadRows()]).finally(() => (inflight = null)));
 
-  // Changement de dossier : sélection remise à zéro, synchronisation en arrière-plan.
+  // Changement de dossier : le cache local s'affiche tout de suite, la synchronisation IMAP tourne en arrière-plan.
   $effect(() => {
     const name = $currentFolder;
     selectedUid.set(null);
     selection.set(new Set());
+    void loadRows();
+    void loadFolders();
     syncFolder(name).then(refresh).catch(fail("Synchronisation impossible"));
   });
 
@@ -67,14 +71,14 @@
     const uid = $selectedUid;
     const name = $currentFolder;
     if (uid === null) { message = null; return; }
+    // `get_message` marque déjà le message lu côté serveur et en cache : pas d'appel séparé.
+    const row = untrack(() => rows.find((r) => r.uid === uid));
+    const wasUnseen = !!row && !row.seen;
+    if (row && wasUnseen) row.seen = true;
     getMessage(name, uid).then((m) => {
       if ($selectedUid === uid) message = m;
+      if (wasUnseen) void loadFolders();
     }).catch(fail("Lecture impossible"));
-    const row = untrack(() => rows.find((r) => r.uid === uid));
-    if (row && !row.seen) {
-      row.seen = true;
-      markSeen(name, uid, true).then(loadFolders).catch(fail("Marquage impossible"));
-    }
   });
 
   onMount(() => {

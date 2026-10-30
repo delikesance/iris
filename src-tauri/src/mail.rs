@@ -67,9 +67,27 @@ fn starttls_negotiate(mut tcp: TcpStream) -> Result<TcpStream, String> {
     }
 }
 
+/// Connexion TCP avec délais bornés (un serveur muet ne doit pas figer l'application) et sans attente de Nagle.
+fn tcp_connect(host: &str, port: u16) -> Result<TcpStream, String> {
+    use std::{net::ToSocketAddrs, time::Duration};
+    let mut last = format!("{host} : adresse introuvable");
+    for addr in (host, port).to_socket_addrs().map_err(e)? {
+        match TcpStream::connect_timeout(&addr, Duration::from_secs(10)) {
+            Ok(t) => {
+                let _ = t.set_nodelay(true);
+                let _ = t.set_read_timeout(Some(Duration::from_secs(60)));
+                let _ = t.set_write_timeout(Some(Duration::from_secs(60)));
+                return Ok(t);
+            }
+            Err(x) => last = x.to_string(),
+        }
+    }
+    Err(last)
+}
+
 fn open_stream(c: &Config) -> Result<(Stream, bool), String> {
     require_plaintext_ok(&c.imap_host, c.imap_security)?;
-    let tcp = TcpStream::connect((c.imap_host.as_str(), c.imap_port)).map_err(e)?;
+    let tcp = tcp_connect(&c.imap_host, c.imap_port)?;
     let tls = || native_tls::TlsConnector::builder().build().map_err(e);
     match c.imap_security {
         Security::Ssl => Ok((Stream::Tls(tls()?.connect(&c.imap_host, tcp).map_err(e)?), true)),
@@ -90,22 +108,45 @@ fn connect(c: &Config) -> Result<Session, String> {
 
 
 static SESSION: std::sync::Mutex<Option<Session>> = std::sync::Mutex::new(None);
+/// Dossier actuellement sélectionné sur la session persistante (évite un SELECT redondant à chaque lecture).
+static SELECTED: Mutex<Option<String>> = Mutex::new(None);
 
-/// Session IMAP persistante : évite un handshake TLS + login à chaque action. Reconnecte si la connexion est tombée.
+fn selected() -> std::sync::MutexGuard<'static, Option<String>> { SELECTED.lock().unwrap_or_else(|p| p.into_inner()) }
+
+/// SELECT sauf si ce dossier est déjà celui de la session. À n'utiliser que pour lire/écrire par UID :
+/// la synchronisation re-sélectionne toujours pour obtenir un `exists` frais.
+fn select_cached(s: &mut Session, folder: &str) -> Result<(), String> {
+    if selected().as_deref() == Some(folder) { return Ok(()); }
+    *selected() = None;
+    s.select(folder).map_err(e)?;
+    *selected() = Some(folder.to_string());
+    Ok(())
+}
+
+fn select_fresh(s: &mut Session, folder: &str) -> Result<imap::types::Mailbox, String> {
+    *selected() = None;
+    let mb = s.select(folder).map_err(e)?;
+    *selected() = Some(folder.to_string());
+    Ok(mb)
+}
+
+/// Session IMAP persistante : évite un handshake TLS + login à chaque action. Reconnecte (une fois) si une session
+/// déjà ouverte échoue ; une erreur sur une session toute neuve est renvoyée telle quelle, sans seconde tentative.
 fn with<T>(f: impl Fn(&mut Session) -> Result<T, String>) -> Result<T, String> {
     let mut g = SESSION.lock().unwrap_or_else(|p| p.into_inner());
     let mut last = String::new();
     for _ in 0..2 {
-        if g.is_none() { *g = Some(connect(&config::load()?)?); }
+        let fresh = g.is_none();
+        if fresh { *selected() = None; *g = Some(connect(&config::load()?)?); }
         match f(g.as_mut().unwrap()) {
             Ok(v) => return Ok(v),
-            Err(e) => { last = e; *g = None; }
+            Err(x) => { last = x; *g = None; *selected() = None; if fresh { break; } }
         }
     }
     Err(last)
 }
 
-pub fn reset() { *SESSION.lock().unwrap_or_else(|p| p.into_inner()) = None; }
+pub fn reset() { *SESSION.lock().unwrap_or_else(|p| p.into_inner()) = None; *selected() = None; }
 
 // ---------- Base de données partagée ----------
 
@@ -274,28 +315,45 @@ pub struct Cached { pub uid: u32, pub seen: bool, pub header: Header }
 
 /// Écrit la fenêtre synchronisée d'un dossier : met à jour, supprime les UID disparus, renvoie les nouveaux UID.
 /// Conserve `thread_id` et `rule_id` des lignes existantes.
+#[cfg(test)]
 pub fn store_headers(conn: &Connection, account: &str, folder: &str, rows: &[Cached]) -> Result<Vec<u32>, String> {
-    let known: HashSet<u32> = {
-        let mut st = conn.prepare("SELECT uid FROM message WHERE account=?1 AND folder=?2").map_err(e)?;
-        let it = st.query_map(params![account, folder], |r| r.get::<_, u32>(0)).map_err(e)?;
+    let window: Vec<(u32, bool)> = rows.iter().map(|r| (r.uid, r.seen)).collect();
+    apply_sync(conn, account, folder, &window, rows)
+}
+
+/// Synchronisation incrémentale : `window` = (UID, lu) de toute la fenêtre serveur, `fresh` = en-têtes des seuls UID à écrire
+/// (nouveaux, ou à réécrire). Une seule transaction : sans elle chaque ligne coûte un fsync.
+pub fn apply_sync(conn: &Connection, account: &str, folder: &str, window: &[(u32, bool)], fresh: &[Cached]) -> Result<Vec<u32>, String> {
+    let tx = conn.unchecked_transaction().map_err(e)?;
+    let known: HashMap<u32, bool> = {
+        let mut st = tx.prepare("SELECT uid, COALESCE(seen,0) FROM message WHERE account=?1 AND folder=?2").map_err(e)?;
+        let it = st.query_map(params![account, folder], |r| Ok((r.get::<_, u32>(0)?, r.get::<_, bool>(1)?))).map_err(e)?;
         it.collect::<Result<_, _>>().map_err(e)?
     };
-    let min = rows.iter().map(|r| r.uid).min().unwrap_or(0);
-    let present: HashSet<u32> = rows.iter().map(|r| r.uid).collect();
-    let mut up = conn.prepare(
-        "INSERT INTO message(account,folder,uid,message_id,in_reply_to,refs,from_name,from_addr,subject,date,seen,has_attach,list_unsubscribe)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
-         ON CONFLICT(account,folder,uid) DO UPDATE SET message_id=excluded.message_id, in_reply_to=excluded.in_reply_to, refs=excluded.refs,
-           from_name=excluded.from_name, from_addr=excluded.from_addr, subject=excluded.subject, date=excluded.date, seen=excluded.seen,
-           has_attach=excluded.has_attach, list_unsubscribe=excluded.list_unsubscribe").map_err(e)?;
+    let min = window.iter().map(|r| r.0).min().unwrap_or(0);
+    let present: HashSet<u32> = window.iter().map(|r| r.0).collect();
+    let rewritten: HashSet<u32> = fresh.iter().map(|r| r.uid).collect();
     let mut new = Vec::new();
-    for r in rows {
-        let h = &r.header;
-        up.execute(params![account, folder, r.uid, h.message_id, h.in_reply_to, h.references.join(" "), h.from_name, h.from_addr,
-            h.subject, h.date, r.seen, h.has_attach, h.list_unsubscribe]).map_err(e)?;
-        if !known.contains(&r.uid) { new.push(r.uid); }
+    {
+        let mut up = tx.prepare(
+            "INSERT INTO message(account,folder,uid,message_id,in_reply_to,refs,from_name,from_addr,subject,date,seen,has_attach,list_unsubscribe)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+             ON CONFLICT(account,folder,uid) DO UPDATE SET message_id=excluded.message_id, in_reply_to=excluded.in_reply_to, refs=excluded.refs,
+               from_name=excluded.from_name, from_addr=excluded.from_addr, subject=excluded.subject, date=excluded.date, seen=excluded.seen,
+               has_attach=excluded.has_attach, list_unsubscribe=excluded.list_unsubscribe").map_err(e)?;
+        for r in fresh {
+            let h = &r.header;
+            up.execute(params![account, folder, r.uid, h.message_id, h.in_reply_to, h.references.join(" "), h.from_name, h.from_addr,
+                h.subject, h.date, r.seen, h.has_attach, h.list_unsubscribe]).map_err(e)?;
+            if !known.contains_key(&r.uid) { new.push(r.uid); }
+        }
+        let mut flag = tx.prepare("UPDATE message SET seen=?4 WHERE account=?1 AND folder=?2 AND uid=?3").map_err(e)?;
+        for (uid, seen) in window {
+            if !rewritten.contains(uid) && known.get(uid).is_some_and(|k| k != seen) { flag.execute(params![account, folder, uid, seen]).map_err(e)?; }
+        }
     }
-    for uid in known.iter().filter(|u| **u >= min && !present.contains(u)) { forget(conn, account, folder, &[*uid])?; }
+    for uid in known.keys().filter(|u| **u >= min && !present.contains(u)) { forget(&tx, account, folder, &[*uid])?; }
+    tx.commit().map_err(e)?;
     Ok(new)
 }
 
@@ -320,12 +378,13 @@ pub fn assign_cached_threads(conn: &Connection, account: &str) -> Result<(), Str
     let (ids, olds): (Vec<_>, Vec<_>) = rows.iter().map(|(id, old, _)| (*id, old.clone())).unzip();
     let mut msgs: Vec<threading::Msg> = rows.into_iter().map(|(_, _, m)| m).collect();
     threading::assign_threads(&mut msgs);
+    let tx = conn.unchecked_transaction().map_err(e)?;
     for ((id, old), m) in ids.into_iter().zip(olds).zip(&msgs) {
         if old.as_deref() != Some(m.thread_id.as_str()) {
-            conn.execute("UPDATE message SET thread_id=?1 WHERE rowid=?2", params![m.thread_id, id]).map_err(e)?;
+            tx.execute("UPDATE message SET thread_id=?1 WHERE rowid=?2", params![m.thread_id, id]).map_err(e)?;
         }
     }
-    Ok(())
+    tx.commit().map_err(e)
 }
 
 fn like_escape(s: &str) -> String { s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_") }
@@ -456,18 +515,48 @@ fn list_entries(s: &mut Session) -> Result<Vec<(String, Option<Role>)>, String> 
     }).collect())
 }
 
+/// Liste des dossiers et compteurs de non lus mémorisés : LIST + un STATUS par dossier coûtent N allers-retours réseau,
+/// et la liste est rechargée après chaque lecture, déplacement ou synchronisation.
+#[derive(Default)]
+struct FolderCache { entries: Vec<(String, Option<Role>)>, listed: Option<std::time::Instant>, unread: HashMap<String, (u32, std::time::Instant)> }
+
+static FOLDERS: std::sync::LazyLock<Mutex<FolderCache>> = std::sync::LazyLock::new(Default::default);
+const LIST_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+const STATUS_TTL: std::time::Duration = std::time::Duration::from_secs(45);
+
+fn folder_cache() -> std::sync::MutexGuard<'static, FolderCache> { FOLDERS.lock().unwrap_or_else(|p| p.into_inner()) }
+
+/// Oublie le compteur d'un dossier modifié localement : son STATUS sera redemandé au prochain `folders()`.
+fn touch_folder(name: &str) { folder_cache().unread.remove(name); }
+
+fn cached_entries(s: &mut Session) -> Result<Vec<(String, Option<Role>)>, String> {
+    let mut c = folder_cache();
+    if c.listed.map_or(true, |t| t.elapsed() > LIST_TTL) {
+        c.entries = list_entries(s)?;
+        c.listed = Some(std::time::Instant::now());
+    }
+    Ok(c.entries.clone())
+}
+
 fn role_folder(s: &mut Session, role: Role) -> Option<String> {
-    list_entries(s).ok()?.into_iter().find(|(_, r)| *r == Some(role)).map(|(n, _)| n)
+    cached_entries(s).ok()?.into_iter().find(|(_, r)| *r == Some(role)).map(|(n, _)| n)
 }
 
 pub fn folders() -> Result<Vec<Folder>, String> {
     let acc = account()?;
     let (entries, unread) = with(|s| {
-        let entries = list_entries(s)?;
-        let unread: HashMap<String, u32> = entries.iter().filter_map(|(n, _)| {
-            let raw = s.run_command_and_read_response(format!("STATUS {} (UNSEEN)", quote(n))).ok()?;
-            Some((n.clone(), parse_status_unseen(&raw)?))
-        }).collect();
+        let entries = cached_entries(s)?;
+        let mut unread: HashMap<String, u32> = HashMap::new();
+        for (n, _) in &entries {
+            let hit = folder_cache().unread.get(n).filter(|(_, t)| t.elapsed() < STATUS_TTL).map(|(u, _)| *u);
+            let value = hit.or_else(|| {
+                let raw = s.run_command_and_read_response(format!("STATUS {} (UNSEEN)", quote(n))).ok()?;
+                let u = parse_status_unseen(&raw)?;
+                folder_cache().unread.insert(n.clone(), (u, std::time::Instant::now()));
+                Some(u)
+            });
+            if let Some(u) = value { unread.insert(n.clone(), u); }
+        }
         Ok((entries, unread))
     })?;
     // Repli sur le cache pour un dossier dont STATUS a échoué.
@@ -486,27 +575,43 @@ pub fn set_after_sync(f: AfterSync) { let _ = AFTER_SYNC.set(f); }
 
 const WINDOW: u32 = 200;
 
-fn fetch_window(s: &mut Session, folder: &str) -> Result<Vec<Cached>, String> {
-    let mb = s.select(folder).map_err(e)?;
-    if mb.exists == 0 { return Ok(vec![]); }
+/// Fenêtre serveur d'un dossier : (UID, lu) pour les `WINDOW` derniers messages, plus les en-têtes des seuls UID absents du cache.
+fn fetch_window(s: &mut Session, folder: &str, known: &HashSet<u32>) -> Result<(Vec<(u32, bool)>, Vec<Cached>), String> {
+    let mb = select_fresh(s, folder)?;
+    if mb.exists == 0 { return Ok((vec![], vec![])); }
     let start = mb.exists.saturating_sub(WINDOW - 1).max(1);
-    let fetched = s.fetch(format!("{start}:*"), "(UID FLAGS BODY.PEEK[HEADER])").map_err(e)?;
-    Ok(fetched.iter().filter_map(|f| {
+    let flags = s.fetch(format!("{start}:*"), "(UID FLAGS)").map_err(e)?;
+    let window: Vec<(u32, bool)> = flags.iter().filter_map(|f| {
+        Some((f.uid?, f.flags().iter().any(|fl| matches!(fl, imap::types::Flag::Seen))))
+    }).collect();
+    let missing: Vec<u32> = window.iter().map(|w| w.0).filter(|u| !known.contains(u)).collect();
+    if missing.is_empty() { return Ok((window, vec![])); }
+    let fetched = s.uid_fetch(uid_set(&missing), "(UID FLAGS BODY.PEEK[HEADER])").map_err(e)?;
+    let fresh = fetched.iter().filter_map(|f| {
         let header = parse_summary(f.header()?).ok()?;
         let seen = f.flags().iter().any(|fl| matches!(fl, imap::types::Flag::Seen));
         Some(Cached { uid: f.uid?, seen, header })
-    }).collect())
+    }).collect();
+    Ok((window, fresh))
 }
 
 /// Rafraîchit le cache d'un dossier depuis IMAP ; renvoie les UID nouveaux (puis appelle le rappel b2).
+/// Incrémental : seuls les en-têtes des UID inconnus sont téléchargés, les autres ne reçoivent que leurs drapeaux.
 pub fn sync_folder(folder: &str) -> Result<Vec<u32>, String> {
+    if folder == SCHEDULED_FOLDER { return Ok(vec![]); } // dossier virtuel : pas de boîte IMAP
     let acc = account()?;
-    let rows = with(|s| fetch_window(s, folder))?;
+    let known: HashSet<u32> = with_db(|c| {
+        let mut st = c.prepare("SELECT uid FROM message WHERE account=?1 AND folder=?2").map_err(e)?;
+        let it = st.query_map(params![acc, folder], |r| r.get::<_, u32>(0)).map_err(e)?;
+        it.collect::<Result<_, _>>().map_err(e)
+    })?;
+    let (window, fresh) = with(|s| fetch_window(s, folder, &known))?;
     let new = with_db(|c| {
-        let new = store_headers(c, &acc, folder, &rows)?;
-        assign_cached_threads(c, &acc)?;
+        let new = apply_sync(c, &acc, folder, &window, &fresh)?;
+        if !new.is_empty() { assign_cached_threads(c, &acc)?; }
         Ok(new)
     })?;
+    touch_folder(folder);
     if let Some(f) = AFTER_SYNC.get() { f(folder, &new); }
     Ok(new)
 }
@@ -528,32 +633,69 @@ pub fn messages(folder: &str, query: Option<&str>, filters: Option<&Filters>) ->
         else { cached_messages(c, &acc, folder, query, &filters.cloned().unwrap_or_default()) })
 }
 
-/// Récupère les messages bruts ; `None` si un message n'existe plus sur le serveur.
+/// Derniers messages bruts lus : rouvrir un mail ou un fil déjà vu ne repasse pas par le réseau.
+static RAW_CACHE: Mutex<Vec<((String, u32), std::sync::Arc<Vec<u8>>)>> = Mutex::new(Vec::new());
+const RAW_CACHE_MAX: usize = 24;
+const RAW_CACHE_BYTES: usize = 8 << 20;
+
+fn raw_cache() -> std::sync::MutexGuard<'static, Vec<((String, u32), std::sync::Arc<Vec<u8>>)>> { RAW_CACHE.lock().unwrap_or_else(|p| p.into_inner()) }
+
+fn raw_cached(folder: &str, uid: u32) -> Option<std::sync::Arc<Vec<u8>>> {
+    raw_cache().iter().find(|((f, u), _)| f == folder && *u == uid).map(|(_, v)| v.clone())
+}
+
+fn raw_remember(folder: &str, uid: u32, raw: &[u8]) {
+    if raw.len() > RAW_CACHE_BYTES { return; }
+    let mut c = raw_cache();
+    c.retain(|((f, u), _)| !(f == folder && *u == uid));
+    c.push(((folder.to_string(), uid), std::sync::Arc::new(raw.to_vec())));
+    if c.len() > RAW_CACHE_MAX { c.remove(0); }
+}
+
+fn raw_forget(folder: &str, uids: &[u32]) { raw_cache().retain(|((f, u), _)| !(f == folder && uids.contains(u))); }
+
+/// Récupère les messages bruts ; `None` si un message n'existe plus sur le serveur. Ne contacte le serveur
+/// que pour les messages absents du cache mémoire.
 fn fetch_raws(refs: &[(String, u32)]) -> Result<Vec<Option<Vec<u8>>>, String> {
-    with(|s| {
-        let mut current = String::new();
-        refs.iter().map(|(folder, uid)| {
-            if *folder != current { s.select(folder).map_err(e)?; current = folder.clone(); }
-            let f = s.uid_fetch(uid.to_string(), "BODY.PEEK[]").map_err(e)?;
-            Ok(f.iter().next().and_then(|f| f.body()).map(<[u8]>::to_vec))
-        }).collect()
-    })
+    let mut out: Vec<Option<Vec<u8>>> = refs.iter().map(|(f, u)| raw_cached(f, *u).map(|a| a.to_vec())).collect();
+    let todo: Vec<usize> = (0..refs.len()).filter(|i| out[*i].is_none()).collect();
+    if todo.is_empty() { return Ok(out); }
+    let got = with(|s| todo.iter().map(|i| {
+        let (folder, uid) = &refs[*i];
+        select_cached(s, folder)?;
+        let f = s.uid_fetch(uid.to_string(), "BODY.PEEK[]").map_err(e)?;
+        Ok(f.iter().next().and_then(|f| f.body()).map(<[u8]>::to_vec))
+    }).collect::<Result<Vec<_>, String>>())?;
+    for (i, raw) in todo.into_iter().zip(got) {
+        if let Some(r) = &raw { raw_remember(&refs[i].0, refs[i].1, r); }
+        out[i] = raw;
+    }
+    Ok(out)
 }
 
 fn fetch_raw(folder: &str, uid: u32) -> Result<Vec<u8>, String> {
     fetch_raws(&[(folder.to_string(), uid)])?.pop().flatten().ok_or_else(|| "message introuvable".to_string())
 }
 
+/// Envoi planifié présenté comme un message (lecture seule) : l'identifiant de la ligne est l'`id` de `scheduled_send`.
+fn scheduled_full(conn: &Connection, acc: &str, id: u32) -> Result<Full, String> {
+    let item = scheduled_pending(conn)?.into_iter().find(|i| i.id == i64::from(id)).ok_or("envoi planifié introuvable ou déjà parti")?;
+    Ok(Full {
+        uid: id, folder: SCHEDULED_FOLDER.into(), from: acc.to_string(), from_name: "Vous".into(), from_addr: acc.to_string(),
+        to: item.to, cc: item.draft.cc.clone().unwrap_or_default(), subject: item.subject, date: item.send_at, message_id: String::new(),
+        thread_id: None, text: item.draft.body.clone(), html: None, attachments: vec![], rule_id: None, rule_name: None, sorted_into: None,
+    })
+}
+
 pub fn message(folder: &str, uid: u32) -> Result<Full, String> {
     let acc = account()?;
+    if folder == SCHEDULED_FOLDER { return with_db(|c| scheduled_full(c, &acc, uid)); }
     let mut full = full_from_raw(&fetch_raw(folder, uid)?, folder, uid)?;
-    mark_seen(folder, uid, true)?;
-    with_db(|c| {
-        if let Some(r) = cached_row(c, &acc, folder, uid) {
-            full.thread_id = r.thread_id; full.rule_id = r.rule_id; full.rule_name = r.rule_name; full.sorted_into = r.sorted_into;
-        }
-        Ok(())
-    })?;
+    let row = with_db(|c| Ok(cached_row(c, &acc, folder, uid)))?;
+    if row.as_ref().map_or(true, |r| !r.seen) { mark_seen(folder, uid, true)?; }
+    if let Some(r) = row {
+        full.thread_id = r.thread_id; full.rule_id = r.rule_id; full.rule_name = r.rule_name; full.sorted_into = r.sorted_into;
+    }
     Ok(full)
 }
 
@@ -579,12 +721,14 @@ pub fn save_attachment(folder: &str, uid: u32, index: u32, dest: &str) -> Result
 pub fn uid_set(uids: &[u32]) -> String { uids.iter().map(u32::to_string).collect::<Vec<_>>().join(",") }
 
 pub fn mark_seen(folder: &str, uid: u32, seen: bool) -> Result<(), String> {
+    if folder == SCHEDULED_FOLDER { return Ok(()); }
     let acc = account()?;
     with(|s| {
-        s.select(folder).map_err(e)?;
+        select_cached(s, folder)?;
         let op = if seen { "+FLAGS.SILENT (\\Seen)" } else { "-FLAGS.SILENT (\\Seen)" };
         s.uid_store(uid.to_string(), op).map(|_| ()).map_err(e)
     })?;
+    touch_folder(folder);
     with_db(|c| set_seen_cache(c, &acc, folder, uid, seen))
 }
 
@@ -605,22 +749,31 @@ fn expunge_uids(s: &mut Session, uids: &str) -> Result<(), String> {
 
 pub fn bulk_move(folder: &str, uids: &[u32], target: &str) -> Result<(), String> {
     if uids.is_empty() || folder == target { return Ok(()); }
+    if folder == SCHEDULED_FOLDER || target == SCHEDULED_FOLDER { return Err("un envoi planifié ne se déplace pas : annulez-le ou attendez son départ".into()); }
     let acc = account()?;
     let set = uid_set(uids);
-    with(|s| { s.select(folder).map_err(e)?; move_uids(s, &set, target) })?;
+    with(|s| { select_cached(s, folder)?; move_uids(s, &set, target) })?;
+    raw_forget(folder, uids);
+    touch_folder(folder); touch_folder(target);
     with_db(|c| forget(c, &acc, folder, uids))
 }
 
 /// Déplace vers la corbeille ; supprime définitivement si le dossier est déjà la corbeille.
 pub fn bulk_delete(folder: &str, uids: &[u32]) -> Result<(), String> {
     if uids.is_empty() { return Ok(()); }
+    if folder == SCHEDULED_FOLDER {
+        return with_db(|c| uids.iter().try_for_each(|id| scheduled_cancel(c, i64::from(*id))));
+    }
     let acc = account()?;
     let set = uid_set(uids);
-    with(|s| {
+    let moved_to = with(|s| {
         let trash = role_folder(s, Role::Trash).unwrap_or_else(|| "Trash".into());
-        s.select(folder).map_err(e)?;
-        if folder == trash { expunge_uids(s, &set) } else { move_uids(s, &set, &trash) }
+        select_cached(s, folder)?;
+        if folder == trash { expunge_uids(s, &set)?; } else { move_uids(s, &set, &trash)?; }
+        Ok(trash)
     })?;
+    raw_forget(folder, uids);
+    touch_folder(folder); touch_folder(&moved_to);
     with_db(|c| forget(c, &acc, folder, uids))
 }
 
@@ -938,6 +1091,32 @@ mod mail_core_tests {
         assert_eq!(f[0].unread, 3);
         assert_eq!(f[3].label, "Envoyés");
         assert_eq!((f[6].kind, f[6].unread, f[0].kind), (FolderKind::Sorted, 1, FolderKind::System));
+    }
+
+    #[test]
+    fn incremental_sync_writes_only_fresh_headers_and_updates_flags() {
+        let c = db::open_in_memory().unwrap();
+        store_headers(&c, "me", "INBOX", &[cached(1, "simple.eml", false), cached(2, "reply.eml", false)]).unwrap();
+        // 1 est devenu lu, 2 a disparu, 5 est nouveau (seul 5 apporte un en-tête)
+        let new = apply_sync(&c, "me", "INBOX", &[(1, true), (5, false)], &[cached(5, "newsletter.eml", false)]).unwrap();
+        assert_eq!(new, vec![5]);
+        let all = cached_messages(&c, "me", "INBOX", None, &Filters::default()).unwrap();
+        let mut got: Vec<(u32, bool)> = all.iter().map(|m| (m.uid, m.seen)).collect();
+        got.sort();
+        assert_eq!(got, vec![(1, true), (5, false)]);
+        // aucun changement : rien de nouveau, rien de supprimé
+        assert!(apply_sync(&c, "me", "INBOX", &[(1, true), (5, false)], &[]).unwrap().is_empty());
+        assert_eq!(cached_messages(&c, "me", "INBOX", None, &Filters::default()).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn scheduled_folder_is_virtual_for_sync_read_and_delete() {
+        assert!(sync_folder(SCHEDULED_FOLDER).unwrap().is_empty());
+        let c = db::open_in_memory().unwrap();
+        let id = schedule(&c, &draft("a@b.fr"), 5_000).unwrap();
+        let full = scheduled_full(&c, "me@example.com", id as u32).unwrap();
+        assert_eq!((full.folder.as_str(), full.to.as_str(), full.date), (SCHEDULED_FOLDER, "a@b.fr", 5_000));
+        assert!(scheduled_full(&c, "me@example.com", 99).is_err());
     }
 
     #[test]

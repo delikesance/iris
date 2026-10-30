@@ -68,7 +68,9 @@ describe("MailScreen", () => {
     expect(screen.queryByLabelText("Signer plan.png")).toBeNull();
     await fireEvent.click(screen.getByLabelText("Signer devis.pdf"));
     expect(get(signingTarget)).toEqual({ folder: "INBOX", uid: 1, index: 0 });
-    expect(invoke).toHaveBeenCalledWith("mark_seen", { folder: "INBOX", uid: 1, seen: true });
+    // get_message marque déjà lu côté Rust : pas d'appel mark_seen séparé.
+    expect(invoke).toHaveBeenCalledWith("get_message", { folder: "INBOX", uid: 1 });
+    expect(invoke).not.toHaveBeenCalledWith("mark_seen", expect.anything());
   });
 
   it("links: sender → contacts, Modifier → rule, Répondre → draft", async () => {

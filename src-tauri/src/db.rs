@@ -2,7 +2,7 @@ use rusqlite::Connection;
 use std::{fs, path::Path};
 
 /// Migrations numérotées : l'index + 1 = `PRAGMA user_version` après application.
-const MIGRATIONS: &[&str] = &[V1];
+const MIGRATIONS: &[&str] = &[V1, V2];
 pub const LATEST: i64 = MIGRATIONS.len() as i64;
 
 const V1: &str = "
@@ -21,6 +21,12 @@ CREATE TABLE document(id INTEGER PRIMARY KEY, name TEXT, path TEXT, sha256 TEXT,
 CREATE TABLE proof_event(id INTEGER PRIMARY KEY, document_id INTEGER, at INTEGER, kind TEXT, detail TEXT);
 ";
 
+/// Tri des listes de messages (dossier + date) et lecture par expéditeur.
+const V2: &str = "
+CREATE INDEX IF NOT EXISTS msg_folder_date ON message(account, folder, date DESC, uid DESC);
+CREATE INDEX IF NOT EXISTS msg_message_id ON message(message_id);
+";
+
 fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
     let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     for (i, sql) in MIGRATIONS.iter().enumerate().skip(current as usize) {
@@ -36,6 +42,10 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
 pub fn open(path: &Path) -> Result<Connection, String> {
     if let Some(dir) = path.parent() { fs::create_dir_all(dir).map_err(|e| e.to_string())?; }
     let mut conn = Connection::open(path).map_err(|e| e.to_string())?;
+    // WAL + synchronous=NORMAL : une écriture ne force plus un fsync de tout le fichier ; les lectures ne bloquent plus l'écriture.
+    let _ = conn.pragma_update(None, "journal_mode", "WAL");
+    let _ = conn.pragma_update(None, "synchronous", "NORMAL");
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
     migrate(&mut conn).map_err(|e| e.to_string())?;
     Ok(conn)
 }
